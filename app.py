@@ -166,6 +166,8 @@ if mtp_df is not None and bank_files_data:
         except Exception as e:
             st.error(f"Reconciliation failed: {e}")
 
+    st.markdown("[☕ Buy me a coffee](https://snippe.me/pay/makilagied)")
+
     # --- Results ---
     res: ReconciliationResult | None = st.session_state.result
     if res is not None:
@@ -239,3 +241,10 @@ else:
         for name, df in bank_files_data[:3]:
             st.caption(name)
             st.dataframe(df.head(5), use_container_width=True)
+
+# Developer acknowledgment (sidebar)
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    "Built by [**Erick D. Makilagi**](https://github.com/makilagied) · "
+    "[@makilagied](https://github.com/makilagied)"
+)

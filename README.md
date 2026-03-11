@@ -44,3 +44,12 @@ Then open the URL shown in the terminal (usually http://localhost:8501).
 ## Logic (script only)
 
 Use `reconcile.reconcile()` from `reconcile.py` with your DataFrames and column names; it returns a `ReconciliationResult` with `matched`, `unmatched_mtp`, `unmatched_bank`, and `multi_matches` DataFrames.
+
+---
+
+## Developer
+
+**Erick D. Makilagi** · [GitHub @makilagied](https://github.com/makilagied)  
+Software engineer focused on FinTech systems, automation, and scalable web applications.
+
+[☕ Buy me a coffee](https://snippe.me/pay/makilagied)
