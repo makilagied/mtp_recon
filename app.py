@@ -8,6 +8,24 @@ import streamlit as st
 import pandas as pd
 from reconcile import reconcile, ReconciliationResult
 
+
+def _safe_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert columns that can overflow PyArrow (e.g. large ints) to string for display."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        try:
+            dtype = out[col].dtype
+            if pd.api.types.is_integer_dtype(dtype):
+                out[col] = out[col].astype("object").astype(str)
+            elif dtype == object:
+                # object columns may contain Python ints too large for C long
+                out[col] = out[col].astype(str)
+        except (TypeError, ValueError, OverflowError):
+            out[col] = out[col].astype(str)
+    return out
+
 st.set_page_config(page_title="DSE MTP Reconciliation", layout="wide")
 st.title("DSE MTP Trades vs Bank Statement Reconciliation")
 st.caption(
@@ -132,7 +150,7 @@ if mtp_df is not None and bank_files_data:
                 )
                 bank_narration_choices.append(narr)
                 bank_credit_choices.append(cred)
-                st.dataframe(df.head(5), use_container_width=True, height=120)
+                st.dataframe(_safe_for_display(df.head(5)), width="stretch", height=120)
 
     # Build combined bank dataframe with standardized narration/credit columns
     combined_frames = []
@@ -189,17 +207,17 @@ if mtp_df is not None and bank_files_data:
         )
         with tab1:
             if not res.matched.empty:
-                st.dataframe(res.matched, use_container_width=True)
+                st.dataframe(_safe_for_display(res.matched), width="stretch")
             else:
                 st.info("No matched rows.")
         with tab2:
             if not res.unmatched_mtp.empty:
-                st.dataframe(res.unmatched_mtp, use_container_width=True)
+                st.dataframe(_safe_for_display(res.unmatched_mtp), width="stretch")
             else:
                 st.info("All MTP rows were matched.")
         with tab3:
             if not res.unmatched_bank.empty:
-                st.dataframe(res.unmatched_bank, use_container_width=True)
+                st.dataframe(_safe_for_display(res.unmatched_bank), width="stretch")
             else:
                 st.info("All bank rows were matched.")
         with tab4:
@@ -207,7 +225,7 @@ if mtp_df is not None and bank_files_data:
                 st.warning(
                     "These MTP rows matched more than one bank row; resolve manually."
                 )
-                st.dataframe(res.multi_matches, use_container_width=True)
+                st.dataframe(_safe_for_display(res.multi_matches), width="stretch")
             else:
                 st.info("No multi-matches.")
 
@@ -235,12 +253,12 @@ else:
     st.info("Upload MTP trades and at least one bank statement Excel file to continue.")
     if mtp_df is not None:
         st.subheader("MTP preview")
-        st.dataframe(mtp_df.head(10), use_container_width=True)
+        st.dataframe(_safe_for_display(mtp_df.head(10)), width="stretch")
     if bank_files_data:
         st.subheader("Bank statement(s) preview")
         for name, df in bank_files_data[:3]:
             st.caption(name)
-            st.dataframe(df.head(5), use_container_width=True)
+            st.dataframe(_safe_for_display(df.head(5)), width="stretch")
 
 # Developer acknowledgment (sidebar)
 st.sidebar.markdown("---")
