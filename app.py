@@ -5,6 +5,7 @@ Upload MTP trades and bank statement Excel files, map columns, run reconciliatio
 
 import io
 import re
+import zipfile
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook
@@ -105,6 +106,10 @@ st.caption(
 # Session state for uploaded data and result
 if "result" not in st.session_state:
     st.session_state.result = None
+if "preserved_matched_mtp" not in st.session_state:
+    st.session_state.preserved_matched_mtp = None
+if "preserved_matched_bank" not in st.session_state:
+    st.session_state.preserved_matched_bank = None
 
 # --- File upload ---
 st.header("1. Upload files")
@@ -116,7 +121,7 @@ with col1:
         type=["xlsx", "xls"],
         key="mtp_upload",
         accept_multiple_files=True,
-        help="Each file's first sheet is used. Map control number and amount per file.",
+        help="Each file's first sheet is used. Map control number and amount per file. If a file has a 'Recon status' column (Matched/Unmatched), only Unmatched rows will be reconciled and Matched rows preserved.",
     )
 with col2:
     bank_files = st.file_uploader(
@@ -124,7 +129,7 @@ with col2:
         type=["xlsx", "xls"],
         key="bank_upload",
         accept_multiple_files=True,
-        help="Upload multiple files to reconcile against all statements together. Each file's first sheet is used.",
+        help="Upload multiple files to reconcile against all statements together. Each file's first sheet is used. If a file has a 'Recon status' column (Matched/Unmatched), only Unmatched rows will be used for matching and Matched rows preserved.",
     )
 
 
@@ -247,6 +252,26 @@ if mtp_files_data and bank_files_data:
         mtp_combined_frames.append(part)
     mtp_df = pd.concat(mtp_combined_frames, ignore_index=True)
 
+    # If MTP has "Recon status" column, only reconcile rows that are not already Matched
+    recon_status_col = None
+    for c in mtp_df.columns:
+        if str(c).strip().lower() == "recon status":
+            recon_status_col = c
+            break
+    preserved_matched_mtp = None
+    if recon_status_col is not None:
+        # Normalize for comparison (Matched / Unmatched / Multi-match etc.)
+        status_vals = mtp_df[recon_status_col].astype(str).str.strip().str.lower()
+        is_matched = status_vals == "matched"
+        preserved_matched_mtp = mtp_df.loc[is_matched].copy()
+        mtp_df = mtp_df.loc[~is_matched].copy()
+        if not preserved_matched_mtp.empty:
+            st.session_state.preserved_matched_mtp = preserved_matched_mtp
+        else:
+            st.session_state.preserved_matched_mtp = None
+    else:
+        st.session_state.preserved_matched_mtp = None
+
     # Build combined bank dataframe with standardized narration/credit columns
     combined_frames = []
     for i, (name, df) in enumerate(bank_files_data):
@@ -261,7 +286,27 @@ if mtp_files_data and bank_files_data:
         combined_frames.append(part)
     bank_df = pd.concat(combined_frames, ignore_index=True)
 
+    # If bank has "Recon status" column, only use rows that are not already Matched for reconciliation
+    bank_recon_status_col = None
+    for c in bank_df.columns:
+        if str(c).strip().lower() == "recon status":
+            bank_recon_status_col = c
+            break
+    if bank_recon_status_col is not None:
+        status_vals_bank = bank_df[bank_recon_status_col].astype(str).str.strip().str.lower()
+        is_matched_bank = status_vals_bank == "matched"
+        st.session_state.preserved_matched_bank = bank_df.loc[is_matched_bank].copy()
+        bank_df = bank_df.loc[~is_matched_bank].copy()
+        if st.session_state.preserved_matched_bank.empty:
+            st.session_state.preserved_matched_bank = None
+    else:
+        st.session_state.preserved_matched_bank = None
+
     st.header("3. Run reconciliation")
+    has_preserved_mtp = st.session_state.preserved_matched_mtp is not None and not st.session_state.preserved_matched_mtp.empty
+    has_preserved_bank = st.session_state.preserved_matched_bank is not None and not st.session_state.preserved_matched_bank.empty
+    if has_preserved_mtp or has_preserved_bank:
+        st.info("Using **Recon status**: only **Unmatched** rows will be reconciled; **Matched** rows from the upload(s) are preserved.")
     if st.button("Reconcile", type="primary"):
         try:
             res = reconcile(
@@ -283,51 +328,171 @@ if mtp_files_data and bank_files_data:
 
     # --- Results ---
     res: ReconciliationResult | None = st.session_state.result
+    preserved_matched_mtp = st.session_state.preserved_matched_mtp
+    preserved_matched_bank = st.session_state.preserved_matched_bank
     if res is not None:
         st.header("4. Results")
 
-        n_matched = len(res.matched)
+        n_preserved_mtp = len(preserved_matched_mtp) if preserved_matched_mtp is not None and not preserved_matched_mtp.empty else 0
+        n_preserved_bank = len(preserved_matched_bank) if preserved_matched_bank is not None and not preserved_matched_bank.empty else 0
+        n_preserved = n_preserved_mtp + n_preserved_bank
+        n_new_matched = len(res.matched)
+        n_matched = n_new_matched + n_preserved
         n_unmatched_mtp = len(res.unmatched_mtp)
         n_unmatched_bank = len(res.unmatched_bank)
         n_multi = len(res.multi_matches)
+        total_mtp_rows = sum(len(mdf) for _, mdf in mtp_files_data)
+        total_bank_rows = sum(len(bdf) for _, bdf in bank_files_data)
+        match_rate_mtp = (n_matched / total_mtp_rows * 100) if total_mtp_rows else 0
+        match_rate_bank = (n_matched / total_bank_rows * 100) if total_bank_rows else 0
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Matched", n_matched)
-        m2.metric("Unmatched MTP", n_unmatched_mtp, help="MTP rows with no matching bank entry")
-        m3.metric("Unmatched bank", n_unmatched_bank, help="Bank rows not matched to any MTP")
-        m4.metric("Multi-matches", n_multi, help="MTP rows that matched more than one bank row — review manually")
+        # Status callout
+        if n_unmatched_mtp == 0 and n_unmatched_bank == 0 and n_multi == 0:
+            st.success("All rows reconciled — no unmatched or multi-matches to review.")
+        elif n_multi > 0:
+            st.warning(f"{n_unmatched_mtp} unmatched MTP, {n_unmatched_bank} unmatched bank, {n_multi} multi-matches — review required.")
+        else:
+            st.info(f"{n_unmatched_mtp} unmatched MTP and {n_unmatched_bank} unmatched bank rows to review.")
 
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["Matched", "Unmatched MTP", "Unmatched bank", "Multi-matches"]
-        )
-        with tab1:
-            if not res.matched.empty:
-                st.dataframe(_safe_for_display(res.matched), width="stretch")
-            else:
-                st.info("No matched rows.")
-        with tab2:
-            if not res.unmatched_mtp.empty:
-                st.dataframe(_safe_for_display(res.unmatched_mtp), width="stretch")
-            else:
-                st.info("All MTP rows were matched.")
-        with tab3:
-            if not res.unmatched_bank.empty:
-                st.dataframe(_safe_for_display(res.unmatched_bank), width="stretch")
-            else:
-                st.info("All bank rows were matched.")
-        with tab4:
-            if not res.multi_matches.empty:
-                st.warning(
-                    "These MTP rows matched more than one bank row; resolve manually."
-                )
-                st.dataframe(_safe_for_display(res.multi_matches), width="stretch")
-            else:
-                st.info("No multi-matches.")
+        # Summary metrics
+        st.subheader("Summary")
+        r1_1, r1_2, r1_3, r1_4 = st.columns(4)
+        r1_1.metric("Preserved (MTP)", n_preserved_mtp, help="Rows already Matched from Recon status in uploaded MTP file(s)")
+        r1_2.metric("Preserved (Bank)", n_preserved_bank, help="Rows already Matched from Recon status in uploaded bank file(s)")
+        r1_3.metric("New matches", n_new_matched, help="Pairs matched in this run")
+        r1_4.metric("Total matched", n_matched, help="Preserved + New matches")
+        r2_1, r2_2, r2_3 = st.columns(3)
+        r2_1.metric("Unmatched MTP", n_unmatched_mtp, help="MTP rows with no matching bank entry")
+        r2_2.metric("Unmatched bank", n_unmatched_bank, help="Bank rows not matched to any MTP")
+        r2_3.metric("Multi-matches", n_multi, help="MTP rows that matched more than one bank row — review manually")
 
-        # Export
+        # Match rate and volume
+        st.subheader("Match rate & volume")
+        rate_1, rate_2, rate_3, rate_4 = st.columns(4)
+        rate_1.metric("Total MTP rows", total_mtp_rows, help="Rows across all uploaded MTP files")
+        rate_2.metric("Total bank rows", total_bank_rows, help="Rows across all uploaded bank files")
+        rate_3.metric("MTP match rate", f"{match_rate_mtp:.1f}%", help="Total matched / Total MTP rows")
+        rate_4.metric("Bank match rate", f"{match_rate_bank:.1f}%", help="Total matched / Total bank rows")
+        st.progress(min(1.0, n_matched / total_mtp_rows) if total_mtp_rows else 0, text="MTP rows matched" if total_mtp_rows else None)
+
+        # Outcome distribution chart
+        st.subheader("Outcome distribution")
+        outcome_df = pd.DataFrame({
+            "Outcome": ["Matched", "Unmatched MTP", "Unmatched bank", "Multi-match"],
+            "Count": [n_matched, n_unmatched_mtp, n_unmatched_bank, n_multi],
+        }).set_index("Outcome")
+        st.bar_chart(outcome_df, height=280)
+
+        # Match breakdown by file (compute rows first for charts)
+        mtp_file_names = [name for name, _ in mtp_files_data]
+        rows_mtp = []
+        for name in mtp_file_names:
+            preserved = 0
+            if preserved_matched_mtp is not None and "_mtp_source" in preserved_matched_mtp.columns:
+                preserved = int((preserved_matched_mtp["_mtp_source"] == name).sum())
+            new = 0
+            if not res.matched.empty and "_mtp_source" in res.matched.columns:
+                new = int((res.matched["_mtp_source"] == name).sum())
+            total = preserved + new
+            rows_mtp.append({"File": name, "Preserved": preserved, "New": new, "Total": total})
+        bank_file_names = [name for name, _ in bank_files_data]
+        bank_source_col = "bank__bank_source" if not res.matched.empty and "bank__bank_source" in res.matched.columns else None
+        rows_bank = []
+        for name in bank_file_names:
+            preserved = 0
+            if preserved_matched_bank is not None and "_bank_source" in preserved_matched_bank.columns:
+                preserved = int((preserved_matched_bank["_bank_source"] == name).sum())
+            new = 0
+            if bank_source_col:
+                new = int((res.matched[bank_source_col] == name).sum())
+            total = preserved + new
+            rows_bank.append({"File": name, "Preserved": preserved, "New": new, "Total": total})
+
+        st.subheader("Match breakdown by file")
+        breakdown_col_mtp, breakdown_col_bank = st.columns(2)
+        with breakdown_col_mtp:
+            st.caption("**MTP files**")
+            if rows_mtp:
+                btm_df = pd.DataFrame(rows_mtp)
+                st.bar_chart(btm_df.set_index("File")[["Preserved", "New", "Total"]], height=220)
+                st.dataframe(btm_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No MTP files.")
+        with breakdown_col_bank:
+            st.caption("**Bank files**")
+            if rows_bank:
+                btb_df = pd.DataFrame(rows_bank)
+                st.bar_chart(btb_df.set_index("File")[["Preserved", "New", "Total"]], height=220)
+                st.dataframe(btb_df, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No bank files.")
+
+        st.markdown("---")
+        with st.expander("Detailed data tables (Matched, Unmatched, Multi-matches)", expanded=True):
+            tab1, tab2, tab3, tab4 = st.tabs(
+                ["Matched", "Unmatched MTP", "Unmatched bank", "Multi-matches"]
+            )
+            with tab1:
+                if n_preserved_mtp > 0:
+                    st.caption("Preserved as Matched — MTP (from Recon status in upload)")
+                    st.dataframe(_safe_for_display(preserved_matched_mtp), width="stretch")
+                if n_preserved_bank > 0:
+                    st.caption("Preserved as Matched — Bank (from Recon status in upload)")
+                    st.dataframe(_safe_for_display(preserved_matched_bank), width="stretch")
+                if n_preserved > 0:
+                    st.markdown("---")
+                    st.caption("Newly matched (this run)")
+                if not res.matched.empty:
+                    st.dataframe(_safe_for_display(res.matched), width="stretch")
+                elif n_preserved == 0:
+                    st.info("No matched rows.")
+            with tab2:
+                if not res.unmatched_mtp.empty:
+                    st.dataframe(_safe_for_display(res.unmatched_mtp), width="stretch")
+                else:
+                    st.info("All MTP rows were matched.")
+            with tab3:
+                if not res.unmatched_bank.empty:
+                    st.dataframe(_safe_for_display(res.unmatched_bank), width="stretch")
+                else:
+                    st.info("All bank rows were matched.")
+            with tab4:
+                if not res.multi_matches.empty:
+                    st.warning(
+                        "These MTP rows matched more than one bank row; resolve manually."
+                    )
+                    st.dataframe(_safe_for_display(res.multi_matches), width="stretch")
+                else:
+                    st.info("No multi-matches.")
+
+        # Export (include summary and breakdown sheets)
         st.subheader("Export")
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        results_buf = io.BytesIO()
+        with pd.ExcelWriter(results_buf, engine="openpyxl") as writer:
+            # Summary counts and rates
+            summary_df = pd.DataFrame([
+                {"Metric": "Preserved (MTP)", "Count": n_preserved_mtp},
+                {"Metric": "Preserved (Bank)", "Count": n_preserved_bank},
+                {"Metric": "New matches", "Count": n_new_matched},
+                {"Metric": "Total matched", "Count": n_matched},
+                {"Metric": "Unmatched MTP", "Count": n_unmatched_mtp},
+                {"Metric": "Unmatched bank", "Count": n_unmatched_bank},
+                {"Metric": "Multi-matches", "Count": n_multi},
+                {"Metric": "Total MTP rows", "Count": total_mtp_rows},
+                {"Metric": "Total bank rows", "Count": total_bank_rows},
+                {"Metric": "MTP match rate %", "Count": round(match_rate_mtp, 2)},
+                {"Metric": "Bank match rate %", "Count": round(match_rate_bank, 2)},
+            ])
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+            # Breakdown by file
+            breakdown_mtp_df = pd.DataFrame(rows_mtp) if rows_mtp else pd.DataFrame(columns=["File", "Preserved", "New", "Total"])
+            breakdown_mtp_df.to_excel(writer, sheet_name="Breakdown_MTP_files", index=False)
+            breakdown_bank_df = pd.DataFrame(rows_bank) if rows_bank else pd.DataFrame(columns=["File", "Preserved", "New", "Total"])
+            breakdown_bank_df.to_excel(writer, sheet_name="Breakdown_Bank_files", index=False)
+            if n_preserved_mtp > 0:
+                preserved_matched_mtp.to_excel(writer, sheet_name="Preserved_Matched_MTP", index=False)
+            if n_preserved_bank > 0:
+                preserved_matched_bank.to_excel(writer, sheet_name="Preserved_Matched_Bank", index=False)
             res.matched.to_excel(writer, sheet_name="Matched", index=False)
             res.unmatched_mtp.to_excel(writer, sheet_name="Unmatched_MTP", index=False)
             res.unmatched_bank.to_excel(
@@ -336,24 +501,33 @@ if mtp_files_data and bank_files_data:
             res.multi_matches.to_excel(
                 writer, sheet_name="Multi_matches", index=False
             )
-        buf.seek(0)
+        results_excel_bytes = results_buf.getvalue()
         st.download_button(
             "Download results (Excel)",
-            data=buf,
+            data=results_excel_bytes,
             file_name="mtp_reconciliation_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # Highlighted originals: MTP = control number only (green/white); statement = full row (green/white)
-        st.subheader("Download originals with highlighting")
+        # Download each uploaded file individually with reconciliation results (Recon status + highlighting)
+        st.subheader("Download uploaded files with results")
+        st.caption(
+            "Each file you uploaded is available below with a **Recon status** column and row highlighting (green = Matched, yellow/white = Unmatched). "
+            "Download files one by one or use the ZIP to get all at once."
+        )
         matched_mtp_indices = set(res.matched["_mtp_index"].values) if not res.matched.empty else set()
+        if preserved_matched_mtp is not None and not preserved_matched_mtp.empty:
+            matched_mtp_indices |= set(preserved_matched_mtp.index)
         matched_bank_indices = set(res.matched["_bank_index"].values) if not res.matched.empty else set()
+        if preserved_matched_bank is not None and not preserved_matched_bank.empty:
+            matched_bank_indices |= set(preserved_matched_bank.index)
         multi_mtp_indices = set(res.multi_matches.index) if not res.multi_matches.empty else set()
 
-        # MTP: one downloadable file per MTP file (no merge)
+        # Build per-file bytes for individual downloads and for ZIP
         mtp_offsets = [0]
         for _name, mdf in mtp_files_data:
             mtp_offsets.append(mtp_offsets[-1] + len(mdf))
+        mtp_file_bytes_list = []
         for i, (name, mdf) in enumerate(mtp_files_data):
             start = mtp_offsets[i]
             def _mtp_status(j):
@@ -369,19 +543,20 @@ if mtp_files_data and bank_files_data:
             mtp_highlighted_bytes = _excel_with_control_column_highlight(
                 mtp_export, "Recon status", control_col
             )
+            mtp_file_bytes_list.append((name, mtp_highlighted_bytes))
             safe_name = _sanitize_sheet_name(name).rstrip("_") or "mtp"
             st.download_button(
-                f"Download **{name}** (control number: green = matched, white = unmatched)",
+                f"Download **{name}** (Recon status + highlighting)",
                 data=mtp_highlighted_bytes,
-                file_name=f"{safe_name}_highlighted.xlsx",
+                file_name=f"{safe_name}_with_results.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"dl_mtp_hl_{i}",
             )
 
-        # Bank: one downloadable file per statement (no merge)
         bank_offsets = [0]
         for _name, bdf in bank_files_data:
             bank_offsets.append(bank_offsets[-1] + len(bdf))
+        bank_file_bytes_list = []
         for i, (name, bdf) in enumerate(bank_files_data):
             start = bank_offsets[i]
             statuses = [
@@ -391,13 +566,34 @@ if mtp_files_data and bank_files_data:
             bank_export = bdf.copy()
             bank_export["Recon status"] = statuses
             bank_highlighted_bytes = _excel_with_highlighted_rows(bank_export)
+            bank_file_bytes_list.append((name, bank_highlighted_bytes))
             safe_name = _sanitize_sheet_name(name).rstrip("_") or "statement"
             st.download_button(
-                f"Download **{name}** (row: green = matched, white = unmatched)",
+                f"Download **{name}** (Recon status + highlighting)",
                 data=bank_highlighted_bytes,
-                file_name=f"{safe_name}_highlighted.xlsx",
+                file_name=f"{safe_name}_with_results.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"dl_bank_hl_{i}",
+            )
+
+        # ZIP with results workbook + all uploaded files with results
+        if mtp_file_bytes_list or bank_file_bytes_list:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("mtp_reconciliation_results.xlsx", results_excel_bytes)
+                for name, data in mtp_file_bytes_list:
+                    safe = _sanitize_sheet_name(name).rstrip("_") or "mtp"
+                    zf.writestr(f"uploaded_with_results/{safe}_with_results.xlsx", data)
+                for name, data in bank_file_bytes_list:
+                    safe = _sanitize_sheet_name(name).rstrip("_") or "statement"
+                    zf.writestr(f"uploaded_with_results/{safe}_with_results.xlsx", data)
+            zip_buf.seek(0)
+            st.download_button(
+                "Download all (results + each uploaded file with results as ZIP)",
+                data=zip_buf.getvalue(),
+                file_name="mtp_recon_all_results.zip",
+                mime="application/zip",
+                key="dl_all_zip",
             )
 
 else:
