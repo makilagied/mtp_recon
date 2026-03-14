@@ -11,9 +11,10 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from reconcile import reconcile, ReconciliationResult
 
-# Excel row highlighting: green = matched, orange = unmatched
+# Excel highlighting: green = matched; white = unmatched (bank); yellow = unmatched (MTP control)
 FILL_MATCHED = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
-FILL_UNMATCHED = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+FILL_WHITE = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+FILL_UNMATCHED_MTP = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
 
 def _safe_for_display(df: pd.DataFrame) -> pd.DataFrame:
@@ -35,16 +36,16 @@ def _safe_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _apply_row_highlights(ws, ncols: int, status_col_idx: int):
-    """Apply green/yellow fill to data rows based on cell value in status column."""
+    """Apply green fill to matched rows, white to unmatched (for bank statement)."""
     for row_idx in range(2, ws.max_row + 1):
         cell = ws.cell(row=row_idx, column=status_col_idx)
-        fill = FILL_MATCHED if (cell.value == "Matched") else FILL_UNMATCHED
+        fill = FILL_MATCHED if (cell.value == "Matched") else FILL_WHITE
         for col_idx in range(1, ncols + 1):
             ws.cell(row=row_idx, column=col_idx).fill = fill
 
 
 def _excel_with_highlighted_rows(df: pd.DataFrame, status_column: str = "Recon status") -> bytes:
-    """Write dataframe to Excel and fill rows: green if status=='Matched', yellow otherwise."""
+    """Write dataframe to Excel and fill rows: green if matched, white if unmatched (bank)."""
     buf = io.BytesIO()
     df.to_excel(buf, index=False, engine="openpyxl")
     buf.seek(0)
@@ -55,6 +56,34 @@ def _excel_with_highlighted_rows(df: pd.DataFrame, status_column: str = "Recon s
     except ValueError:
         status_col_idx = df.shape[1]
     _apply_row_highlights(ws, df.shape[1], status_col_idx)
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
+def _excel_with_control_column_highlight(
+    df: pd.DataFrame,
+    status_column: str = "Recon status",
+    control_column: str | None = None,
+) -> bytes:
+    """Write dataframe to Excel; only the control number column is filled: green if matched, white if unmatched."""
+    if control_column is None or control_column not in df.columns:
+        control_column = df.columns[0]
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    wb = load_workbook(buf)
+    ws = wb.active
+    try:
+        status_col_idx = list(df.columns).index(status_column) + 1
+    except ValueError:
+        status_col_idx = len(df.columns)
+    control_col_idx = list(df.columns).index(control_column) + 1
+    for row_idx in range(2, ws.max_row + 1):
+        status_cell = ws.cell(row=row_idx, column=status_col_idx)
+        fill = FILL_MATCHED if (status_cell.value == "Matched") else FILL_UNMATCHED_MTP
+        ws.cell(row=row_idx, column=control_col_idx).fill = fill
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
@@ -315,7 +344,7 @@ if mtp_files_data and bank_files_data:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # Highlighted originals: same as uploaded, green = matched, orange = unmatched
+        # Highlighted originals: MTP = control number only (green/white); statement = full row (green/white)
         st.subheader("Download originals with highlighting")
         matched_mtp_indices = set(res.matched["_mtp_index"].values) if not res.matched.empty else set()
         matched_bank_indices = set(res.matched["_bank_index"].values) if not res.matched.empty else set()
@@ -336,10 +365,13 @@ if mtp_files_data and bank_files_data:
                 return "Unmatched"
             mtp_export = mdf.copy()
             mtp_export["Recon status"] = [ _mtp_status(j) for j in range(len(mdf)) ]
-            mtp_highlighted_bytes = _excel_with_highlighted_rows(mtp_export)
+            control_col = mtp_control_choices[i]
+            mtp_highlighted_bytes = _excel_with_control_column_highlight(
+                mtp_export, "Recon status", control_col
+            )
             safe_name = _sanitize_sheet_name(name).rstrip("_") or "mtp"
             st.download_button(
-                f"Download **{name}** (green = matched, orange = unmatched)",
+                f"Download **{name}** (control number: green = matched, white = unmatched)",
                 data=mtp_highlighted_bytes,
                 file_name=f"{safe_name}_highlighted.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -361,7 +393,7 @@ if mtp_files_data and bank_files_data:
             bank_highlighted_bytes = _excel_with_highlighted_rows(bank_export)
             safe_name = _sanitize_sheet_name(name).rstrip("_") or "statement"
             st.download_button(
-                f"Download **{name}** (green = matched, orange = unmatched)",
+                f"Download **{name}** (row: green = matched, white = unmatched)",
                 data=bank_highlighted_bytes,
                 file_name=f"{safe_name}_highlighted.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
