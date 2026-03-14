@@ -74,10 +74,6 @@ st.caption(
 )
 
 # Session state for uploaded data and result
-if "mtp_df" not in st.session_state:
-    st.session_state.mtp_df = None
-if "bank_df" not in st.session_state:
-    st.session_state.bank_df = None
 if "result" not in st.session_state:
     st.session_state.result = None
 
@@ -86,11 +82,12 @@ st.header("1. Upload files")
 col1, col2 = st.columns(2)
 
 with col1:
-    mtp_file = st.file_uploader(
-        "MTP trades (Excel)",
+    mtp_files = st.file_uploader(
+        "MTP trades (Excel) — upload one or more",
         type=["xlsx", "xls"],
         key="mtp_upload",
-        help="Sheet should have a control number column and an amount paid column.",
+        accept_multiple_files=True,
+        help="Each file's first sheet is used. Map control number and amount per file.",
     )
 with col2:
     bank_files = st.file_uploader(
@@ -119,11 +116,19 @@ def _idx(cols, *prefer):
     return 0
 
 
-# Load data when files are uploaded (Streamlit re-runs on change)
-if mtp_file is not None:
-    st.session_state.mtp_df = load_excel(mtp_file)
+# Store each MTP file as (name, df)
+if "mtp_files_data" not in st.session_state:
+    st.session_state.mtp_files_data = []
+
+if mtp_files:
+    st.session_state.mtp_files_data = []
+    for i, f in enumerate(mtp_files):
+        name = getattr(f, "name", f"MTP_{i+1}")
+        df = load_excel(f)
+        if df is not None and not df.empty:
+            st.session_state.mtp_files_data.append((name, df))
 else:
-    st.session_state.mtp_df = None
+    st.session_state.mtp_files_data = []
     st.session_state.result = None
 
 # Store each bank statement as (name, df) so we can map columns per file
@@ -142,30 +147,39 @@ else:
     st.session_state.bank_files_data = []
     st.session_state.result = None
 
-mtp_df = st.session_state.mtp_df
+mtp_files_data = st.session_state.mtp_files_data
 bank_files_data = st.session_state.bank_files_data
 
 # --- Column mapping ---
 st.header("2. Map columns")
 
-if mtp_df is not None and bank_files_data:
-    mtp_cols = list(mtp_df.columns)
-
+if mtp_files_data and bank_files_data:
     col_a, col_b = st.columns(2)
     with col_a:
-        st.subheader("MTP trades")
-        mtp_control = st.selectbox(
-            "Column for DSE control number",
-            options=mtp_cols,
-            index=_idx(mtp_cols, "dse_control_number", "control_number", "reference"),
-            key="mtp_control",
-        )
-        mtp_amount = st.selectbox(
-            "Column for amount paid",
-            options=mtp_cols,
-            index=_idx(mtp_cols, "amount_paid", "amount", "credit"),
-            key="mtp_amount",
-        )
+        st.subheader("MTP file(s) — map per file")
+        st.caption("Each file can have different column names. Choose control number and amount for each.")
+        mtp_control_choices = []
+        mtp_amount_choices = []
+        for i, (name, df) in enumerate(mtp_files_data):
+            mcols = list(df.columns)
+            with st.expander(f"**{name}** ({len(df)} rows)", expanded=(i == 0)):
+                mi = _idx(mcols, "dse_control_number", "control_number", "reference", "Reference")
+                ai = _idx(mcols, "amount_paid", "amount", "credit", "Amount")
+                ctrl = st.selectbox(
+                    "DSE control number",
+                    options=mcols,
+                    index=mi,
+                    key=f"mtp_ctrl_{i}",
+                )
+                amt = st.selectbox(
+                    "Amount paid",
+                    options=mcols,
+                    index=ai,
+                    key=f"mtp_amt_{i}",
+                )
+                mtp_control_choices.append(ctrl)
+                mtp_amount_choices.append(amt)
+                st.dataframe(_safe_for_display(df.head(5)), width="stretch", height=120)
     with col_b:
         st.subheader("Bank statement(s) — map per file")
         st.caption("Each file can have different column names. Choose narration and credit for each.")
@@ -192,6 +206,18 @@ if mtp_df is not None and bank_files_data:
                 bank_credit_choices.append(cred)
                 st.dataframe(_safe_for_display(df.head(5)), width="stretch", height=120)
 
+    # Build combined MTP dataframe with standardized columns
+    mtp_combined_frames = []
+    for i, (name, df) in enumerate(mtp_files_data):
+        part = df.copy()
+        part = part.rename(columns={
+            mtp_control_choices[i]: "_recon_control",
+            mtp_amount_choices[i]: "_recon_amount",
+        })
+        part["_mtp_source"] = name
+        mtp_combined_frames.append(part)
+    mtp_df = pd.concat(mtp_combined_frames, ignore_index=True)
+
     # Build combined bank dataframe with standardized narration/credit columns
     combined_frames = []
     for i, (name, df) in enumerate(bank_files_data):
@@ -211,8 +237,8 @@ if mtp_df is not None and bank_files_data:
         try:
             res = reconcile(
                 mtp_df=mtp_df,
-                mtp_control_col=mtp_control,
-                mtp_amount_col=mtp_amount,
+                mtp_control_col="_recon_control",
+                mtp_amount_col="_recon_amount",
                 bank_df=bank_df,
                 bank_narration_col="_recon_narration",
                 bank_credit_col="_recon_credit",
@@ -289,29 +315,36 @@ if mtp_df is not None and bank_files_data:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # Highlighted originals: same as uploaded, green = matched, yellow = unmatched
+        # Highlighted originals: same as uploaded, green = matched, orange = unmatched
         st.subheader("Download originals with highlighting")
         matched_mtp_indices = set(res.matched["_mtp_index"].values) if not res.matched.empty else set()
         matched_bank_indices = set(res.matched["_bank_index"].values) if not res.matched.empty else set()
         multi_mtp_indices = set(res.multi_matches.index) if not res.multi_matches.empty else set()
 
-        # MTP: add Recon status, then export with row highlights
-        mtp_export = mtp_df.copy()
-        def _mtp_status(i):
-            if i in matched_mtp_indices:
-                return "Matched"
-            if i in multi_mtp_indices:
-                return "Multi-match"
-            return "Unmatched"
-        mtp_export["Recon status"] = mtp_export.index.map(_mtp_status)
-        mtp_highlighted_bytes = _excel_with_highlighted_rows(mtp_export)
-        st.download_button(
-            "Download MTP (green = matched, orange = unmatched)",
-            data=mtp_highlighted_bytes,
-            file_name="mtp_highlighted.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_mtp_hl",
-        )
+        # MTP: one downloadable file per MTP file (no merge)
+        mtp_offsets = [0]
+        for _name, mdf in mtp_files_data:
+            mtp_offsets.append(mtp_offsets[-1] + len(mdf))
+        for i, (name, mdf) in enumerate(mtp_files_data):
+            start = mtp_offsets[i]
+            def _mtp_status(j):
+                idx = start + j
+                if idx in matched_mtp_indices:
+                    return "Matched"
+                if idx in multi_mtp_indices:
+                    return "Multi-match"
+                return "Unmatched"
+            mtp_export = mdf.copy()
+            mtp_export["Recon status"] = [ _mtp_status(j) for j in range(len(mdf)) ]
+            mtp_highlighted_bytes = _excel_with_highlighted_rows(mtp_export)
+            safe_name = _sanitize_sheet_name(name).rstrip("_") or "mtp"
+            st.download_button(
+                f"Download **{name}** (green = matched, orange = unmatched)",
+                data=mtp_highlighted_bytes,
+                file_name=f"{safe_name}_highlighted.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_mtp_hl_{i}",
+            )
 
         # Bank: one downloadable file per statement (no merge)
         bank_offsets = [0]
@@ -336,10 +369,12 @@ if mtp_df is not None and bank_files_data:
             )
 
 else:
-    st.info("Upload MTP trades and at least one bank statement Excel file to continue.")
-    if mtp_df is not None:
-        st.subheader("MTP preview")
-        st.dataframe(_safe_for_display(mtp_df.head(10)), width="stretch")
+    st.info("Upload at least one MTP file and one bank statement Excel file to continue.")
+    if mtp_files_data:
+        st.subheader("MTP file(s) preview")
+        for name, df in mtp_files_data[:3]:
+            st.caption(name)
+            st.dataframe(_safe_for_display(df.head(5)), width="stretch")
     if bank_files_data:
         st.subheader("Bank statement(s) preview")
         for name, df in bank_files_data[:3]:
