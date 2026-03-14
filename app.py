@@ -4,9 +4,16 @@ Upload MTP trades and bank statement Excel files, map columns, run reconciliatio
 """
 
 import io
+import re
 import streamlit as st
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 from reconcile import reconcile, ReconciliationResult
+
+# Excel row highlighting: green = matched, orange = unmatched
+FILL_MATCHED = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
+FILL_UNMATCHED = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
 
 
 def _safe_for_display(df: pd.DataFrame) -> pd.DataFrame:
@@ -25,6 +32,39 @@ def _safe_for_display(df: pd.DataFrame) -> pd.DataFrame:
         except (TypeError, ValueError, OverflowError):
             out[col] = out[col].astype(str)
     return out
+
+
+def _apply_row_highlights(ws, ncols: int, status_col_idx: int):
+    """Apply green/yellow fill to data rows based on cell value in status column."""
+    for row_idx in range(2, ws.max_row + 1):
+        cell = ws.cell(row=row_idx, column=status_col_idx)
+        fill = FILL_MATCHED if (cell.value == "Matched") else FILL_UNMATCHED
+        for col_idx in range(1, ncols + 1):
+            ws.cell(row=row_idx, column=col_idx).fill = fill
+
+
+def _excel_with_highlighted_rows(df: pd.DataFrame, status_column: str = "Recon status") -> bytes:
+    """Write dataframe to Excel and fill rows: green if status=='Matched', yellow otherwise."""
+    buf = io.BytesIO()
+    df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+    wb = load_workbook(buf)
+    ws = wb.active
+    try:
+        status_col_idx = list(df.columns).index(status_column) + 1  # 1-based
+    except ValueError:
+        status_col_idx = df.shape[1]
+    _apply_row_highlights(ws, df.shape[1], status_col_idx)
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
+def _sanitize_sheet_name(name: str, max_len: int = 31) -> str:
+    """Excel sheet names: max 31 chars, no : \\ / ? * [ ]."""
+    name = re.sub(r'[:\\/?*\[\]]', "_", str(name))
+    return name[:max_len] if len(name) > max_len else name or "Sheet"
 
 st.set_page_config(page_title="DSE MTP Reconciliation", layout="wide")
 st.title("DSE MTP Trades vs Bank Statement Reconciliation")
@@ -248,6 +288,52 @@ if mtp_df is not None and bank_files_data:
             file_name="mtp_reconciliation_results.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+        # Highlighted originals: same as uploaded, green = matched, yellow = unmatched
+        st.subheader("Download originals with highlighting")
+        matched_mtp_indices = set(res.matched["_mtp_index"].values) if not res.matched.empty else set()
+        matched_bank_indices = set(res.matched["_bank_index"].values) if not res.matched.empty else set()
+        multi_mtp_indices = set(res.multi_matches.index) if not res.multi_matches.empty else set()
+
+        # MTP: add Recon status, then export with row highlights
+        mtp_export = mtp_df.copy()
+        def _mtp_status(i):
+            if i in matched_mtp_indices:
+                return "Matched"
+            if i in multi_mtp_indices:
+                return "Multi-match"
+            return "Unmatched"
+        mtp_export["Recon status"] = mtp_export.index.map(_mtp_status)
+        mtp_highlighted_bytes = _excel_with_highlighted_rows(mtp_export)
+        st.download_button(
+            "Download MTP (green = matched, orange = unmatched)",
+            data=mtp_highlighted_bytes,
+            file_name="mtp_highlighted.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_mtp_hl",
+        )
+
+        # Bank: one downloadable file per statement (no merge)
+        bank_offsets = [0]
+        for _name, bdf in bank_files_data:
+            bank_offsets.append(bank_offsets[-1] + len(bdf))
+        for i, (name, bdf) in enumerate(bank_files_data):
+            start = bank_offsets[i]
+            statuses = [
+                "Matched" if (start + j) in matched_bank_indices else "Unmatched"
+                for j in range(len(bdf))
+            ]
+            bank_export = bdf.copy()
+            bank_export["Recon status"] = statuses
+            bank_highlighted_bytes = _excel_with_highlighted_rows(bank_export)
+            safe_name = _sanitize_sheet_name(name).rstrip("_") or "statement"
+            st.download_button(
+                f"Download **{name}** (green = matched, orange = unmatched)",
+                data=bank_highlighted_bytes,
+                file_name=f"{safe_name}_highlighted.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_bank_hl_{i}",
+            )
 
 else:
     st.info("Upload MTP trades and at least one bank statement Excel file to continue.")
